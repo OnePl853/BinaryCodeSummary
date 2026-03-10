@@ -73,7 +73,7 @@ class TrainManager(object):
     """
     Manage the whole training loop and validation.
     """
-    def __init__(self, model:Model, cfg:dict):
+    def __init__(self, model:Model, cfg:dict, vocab_info:Dict=None):
         self.cfg = cfg
         self.mode = cfg["model"]["mode"]
         # assert self.mode in {"assembly_comment", "assembly_cfg_comment", "assembly_cfg_pseudo_comment",
@@ -91,8 +91,22 @@ class TrainManager(object):
         self.log_valid_samples = train_cfg.get("log_valid_samples", [0, 1, 2])
 
         # CPU and GPU
-        use_cuda = train_cfg["use_cuda"] and torch.cuda.is_available()
-        self.n_gpu = torch.cuda.device_count() if use_cuda else 0  
+        # ======== GPU 诊断信息（来自 gpuuse.py，用于排查 CUDA / 设备可见性问题） ========
+        gpu_available = torch.cuda.is_available()
+        gpu_count = torch.cuda.device_count() if gpu_available else 0
+        logger.info("[GPU DEBUG] torch.cuda.is_available() = %s", gpu_available)
+        logger.info("[GPU DEBUG] torch.cuda.device_count() = %d", gpu_count)
+        if gpu_available and gpu_count > 0:
+            try:
+                logger.info("[GPU DEBUG] GPU[0] name: %s", torch.cuda.get_device_name(0))
+            except Exception as e:
+                logger.warning("[GPU DEBUG] Failed to get GPU name: %s", e)
+        else:
+            logger.info("[GPU DEBUG] No GPU available, will fall back to CPU (unless use_cuda=False).")
+        # ======== GPU 诊断信息结束 ========
+
+        use_cuda = train_cfg["use_cuda"] and gpu_available
+        self.n_gpu = gpu_count if use_cuda else 0  
         self.device = torch.device("cuda" if use_cuda else "cpu")
         logger.info("*"*10 + "{} GPUs are used.".format(self.n_gpu) + "*"*10)
         num_workers = train_cfg.get("num_workers", 0)
@@ -109,8 +123,37 @@ class TrainManager(object):
 
         # model 
         self.model = model
+        logger.info("*"*10 + "You are using {} .".format(self.device.type) + "*"*10)
         if self.device.type == "cuda":
             self.model.to(self.device)
+
+        # ========== 知识蒸馏 (Knowledge Distillation): 加载教师模型与蒸馏超参 ==========
+        self.teacher_model = None
+        self.distill_temperature = None
+        self.distill_alpha = None
+        teacher_ckpt = train_cfg.get("teacher_ckpt", "") or (train_cfg.get("distill") or {}).get("teacher_ckpt", "")
+        if teacher_ckpt and str(teacher_ckpt).strip():
+            teacher_path = Path(teacher_ckpt)
+            if teacher_path.is_file() and vocab_info is not None:
+                logger.info("[KD] Loading teacher model from %s for knowledge distillation.", teacher_path)
+                teacher_model = build_model(model_cfg=cfg["model"], vocab_info=vocab_info)
+                ckpt = torch.load(teacher_path, map_location=self.device)
+                teacher_model.load_state_dict(ckpt["model_state"], strict=True)
+                teacher_model.eval()
+                for p in teacher_model.parameters():
+                    p.requires_grad = False
+                teacher_model.to(self.device)
+                self.teacher_model = teacher_model
+                distill_cfg = train_cfg.get("distill") or {}
+                self.distill_temperature = distill_cfg.get("temperature", 4.0)
+                self.distill_alpha = distill_cfg.get("alpha", 0.5)
+                logger.info("[KD] Teacher loaded. temperature=%.2f, alpha=%.2f (CE weight).", self.distill_temperature, self.distill_alpha)
+            else:
+                if not teacher_path.is_file():
+                    logger.warning("[KD] teacher_ckpt not found: %s. Proceeding without distillation.", teacher_path)
+                elif vocab_info is None:
+                    logger.warning("[KD] vocab_info is None, cannot build teacher. Proceeding without distillation.")
+        # ========== 知识蒸馏 结束 ==========
 
         # learning rate and optimization & schedular
         self.learning_rate_min = train_cfg.get("learning_rate_min", 1.0e-8)
@@ -355,6 +398,62 @@ class TrainManager(object):
         # comment_token_mask (batch, 1, trg_length)
         # comment_token_mask: normal is True, pad is False
         ntokens = (comment_tokens_output != PAD_ID).data.sum().item()
+        batch_length = comment_tokens.size(0)
+
+        # ========== 知识蒸馏 (KD): 若已加载教师，则使用 CE + KD 损失；否则仅 CE ==========
+        if self.teacher_model is not None and self.mode == "assembly_cfg_pseudo_comment":
+            # [KD] 教师前向，不反传梯度
+            with torch.no_grad():
+                teacher_logits = self.teacher_model(
+                    return_type="logits_assembly_cfg_pseudo_comment",
+                    assembly_token_input=assembly_tokens,
+                    cfg_node_input=cfg_nodes,
+                    cfg_node_batch=cfg_node_batch,
+                    edge_index=cfg_edges,
+                    trg_input=comment_tokens_input,
+                    trg_truth=comment_tokens_output,
+                    assembly_token_mask=assembly_tokens_mask,
+                    cfg_node_mask=None,
+                    trg_mask=comment_token_mask,
+                    pseudo_token_input=pseudo_tokens,
+                    pseudo_token_mask=pseudo_tokens_mask,
+                    pseudo_token_codet5_input=pseudo_tokens_codet5,
+                    pseudo_token_codet5_mask=pseudo_tokens_codet5_mask,
+                )
+            # [KD] 学生前向，得到 logits 用于 CE 与 KD
+            student_logits = self.model(
+                return_type="logits_assembly_cfg_pseudo_comment",
+                assembly_token_input=assembly_tokens,
+                cfg_node_input=cfg_nodes,
+                cfg_node_batch=cfg_node_batch,
+                edge_index=cfg_edges,
+                trg_input=comment_tokens_input,
+                trg_truth=comment_tokens_output,
+                assembly_token_mask=assembly_tokens_mask,
+                cfg_node_mask=None,
+                trg_mask=comment_token_mask,
+                pseudo_token_input=pseudo_tokens,
+                pseudo_token_mask=pseudo_tokens_mask,
+                pseudo_token_codet5_input=pseudo_tokens_codet5,
+                pseudo_token_codet5_mask=pseudo_tokens_codet5_mask,
+            )
+            # [KD] CE：学生 vs 真实标签
+            student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
+            ce_loss = self.model.loss_function(student_log_probs, target=comment_tokens_output)
+            # [KD] KD：Hinton 软标签 KL(teacher||student)，仅非 padding 位置，温度 T
+            T = self.distill_temperature
+            teacher_soft = torch.nn.functional.softmax(teacher_logits / T, dim=-1)
+            student_log_soft = torch.nn.functional.log_softmax(student_logits / T, dim=-1)
+            pad_mask = (comment_tokens_output != PAD_ID).float().unsqueeze(-1)
+            kd_per_token = torch.nn.functional.kl_div(
+                student_log_soft, teacher_soft, reduction="none"
+            ).sum(dim=-1)
+            kd_loss = (kd_per_token * pad_mask.squeeze(-1)).sum() * (T * T)
+            # [KD] 总损失: alpha*CE + (1-alpha)*KD
+            batch_loss = self.distill_alpha * ce_loss + (1.0 - self.distill_alpha) * kd_loss
+            sentence_loss = batch_loss / batch_length
+            return sentence_loss, ntokens
+        # ========== 知识蒸馏 结束 ==========
 
         # get loss (run as during training with teacher forcing)
         batch_loss = self.model(return_type="loss_{}".format(self.mode), 
@@ -370,9 +469,8 @@ class TrainManager(object):
                                 pseudo_token_input=pseudo_tokens,
                                 pseudo_token_mask=pseudo_tokens_mask,
                                 pseudo_token_codet5_input=pseudo_tokens_codet5,
-                                pseudo_token_codet5_mask=pseudo_tokens_codet5_mask) 
-        
-        batch_length = comment_tokens.size(0)
+                                pseudo_token_codet5_mask=pseudo_tokens_codet5_mask)
+
         sentence_loss = batch_loss / batch_length
         # NOTE sentence_loss is the average-sentence level loss.
         return sentence_loss, ntokens
@@ -706,8 +804,8 @@ def train(cfg_file: str):
     # build model
     model = build_model(model_cfg=cfg["model"], vocab_info=vocab_info)
 
-    # training management
-    trainer = TrainManager(model=model, cfg=cfg)
+    # training management (传入 vocab_info 以便知识蒸馏时构建教师模型)
+    trainer = TrainManager(model=model, cfg=cfg, vocab_info=vocab_info)
 
     # train model
     trainer.train_and_validate(train_dataset=train_dataset, valid_dataset=valid_dataset, vocab_info=vocab_info)

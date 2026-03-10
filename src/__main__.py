@@ -7,7 +7,7 @@ def main():
     parser = argparse.ArgumentParser("BinaryCodeSummary")
     parser.add_argument("mode", type=str, default="train", choices=["train", "test", "unittest"])
     parser.add_argument("--config", type=str, default="configs/dataset_gcc-7.3.0_arm_32_O1_strip/O1_test3_cszx.yaml")
-    parser.add_argument("--gpu", type=str, default='1')
+    parser.add_argument("--gpu", type=str, default='0')
     parser.add_argument("--ckpt", type=str, default=None, help="Model Checkpoint")
     args = parser.parse_args()
 

@@ -9,7 +9,7 @@ data:
     valid_data_path: "datas/dataset_gcc-7.3.0_arm_32_O1_strip/valid_refined.json" 
     test_data_path: "datas/dataset_gcc-7.3.0_arm_32_O1_strip/test_refined.json"
     use_tokenizer: "robertatokenizer" # sentencepiece or robertatokenizer
-    robertatokenizer: "/home/lyf/projects/models/codet5-base"
+    robertatokenizer: "/home/lyf/projects/CP-BCS/models/codet5-base"
     architecture: "arm_32" # 'x86_64', 'x86_32', 'arm_32'
     use_refined_pseudo_code: True
 
@@ -33,7 +33,8 @@ data:
         token_max_len: 400
 
 training:
-    model_dir: "models/dataset_gcc-7.3.0_arm_32_O1_strip/test10_cszx"
+    model_dir: "models/dataset_gcc-7.3.0_arm_32_O1_strip/students_cszx"
+    # model_dir: "models/dataset_gcc-7.3.0_arm_32_O1_strip/test10_cszx"
     overwrite: False
     load_model: False 
     random_seed: 980820
@@ -73,6 +74,10 @@ training:
     reset_scheduler: False
     reset_optimzer: False
     reset_iteration_state: False
+    teacher_ckpt: "models/dataset_gcc-7.3.0_arm_32_O1_strip/test10_cszx/teacher.ckpt"
+    distill:
+        temperature: 4.0
+        alpha: 0.5
 
 testing: 
     batch_size: 64

@@ -997,8 +997,42 @@ class Model(nn.Module):
             log_probs = F.log_softmax(logits, dim=-1)
 
             batch_loss = self.loss_function(log_probs, target=trg_truth)
-            return batch_loss 
-        
+            return batch_loss
+        # ========== 知识蒸馏 (KD): 返回 logits 供 train_step 计算 CE+KD 损失 ==========
+        elif return_type == "logits_assembly_cfg_pseudo_comment":
+            embed_assembly_token = self.assembly_token_embed(source=assembly_token_input)
+            transformer_encoder_output = self.transformer_encoder(
+                embed_src=embed_assembly_token, 
+                mask=assembly_token_mask)
+            
+            embed_cfg_node = self.cfg_node_embed(source=cfg_node_input)
+            gnn_encoder_output, node_mask = self.gnn_encoder(
+                node_feature=embed_cfg_node,
+                edge_index=edge_index,
+                node_batch=cfg_node_batch)
+            
+            embed_pseudo_token = self.pseudo_token_embed(source=pseudo_token_input)
+            pseudo_encoder_output = self.pseudo_encoder(
+                embed_src=embed_pseudo_token,
+                mask=pseudo_token_mask)
+
+            embed_comment_token = self.comment_token_embed(source=trg_input)
+
+            transformer_decoder_output, _, _= self.transformer_decoder(
+                src_encoder_output=transformer_encoder_output, 
+                gnn_encoder_output=gnn_encoder_output,
+                pseudo_encoder_output=pseudo_encoder_output,
+                embed_trg=embed_comment_token,
+                src_mask=assembly_token_mask,
+                node_mask=node_mask,
+                trg_mask=trg_mask,
+                pseudo_mask=pseudo_token_mask,
+                mode="assembly_cfg_pseudo_comment"
+            )
+
+            logits = self.output_layer(transformer_decoder_output)
+            return logits
+        # ========== 知识蒸馏 结束 ==========
         elif return_type == "encode_assembly_comment":
             embed_assembly_token = self.assembly_token_embed(source=assembly_token_input)
 
